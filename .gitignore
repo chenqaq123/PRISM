@@ -7,3 +7,6 @@ PAPER_DESIGN_v4.md
 *.json
 *.md
 .DS_Store
+figures/
+.claude/
+__pycache__/

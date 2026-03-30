@@ -1,18 +1,52 @@
 """
-Bayesian Risk Aggregation + Kill Chain Group Generation.
+Risk Score Fusion + Kill Chain Group Generation.
 
-Bayesian fusion:
-  P(M=1 | s1,s2,s3,s4) ∝ P(M=1) * ∏ P(si | M=1)
+Score fusion strategy: weighted sigmoid
+─────────────────────────────────────────────────────────────────────────────
+The previous naive-Bayes (Beta-likelihood) formulation was replaced because:
 
-Each module's likelihood is modeled as a Beta distribution calibrated from
-domain knowledge (in lieu of a held-out validation set).
+  1. Conditional-independence assumption is structurally violated in the v5
+     pipeline — Phase 2b (NL consistency, s1) is explicitly conditioned on
+     Phase 1 outputs (s2, s3), so ∏ P(si|M) double-counts shared information.
+
+  2. All Beta parameters were hand-tuned without a validation set, giving a
+     false sense of calibration.
+
+  3. The AV3 structural failure (s1≈0 from clean NL catastrophically
+     suppressing the posterior even when s2, s3 are high) required a separate
+     hard override — a symptom that the model was wrong.
+
+Replacement: calibrated weighted sigmoid
+─────────────────────────────────────────────────────────────────────────────
+  raw = w_s3·s3 + w_s2·s2 + w_pl·s_pipeline + w_pk·s_plugin
+      + w_int·(s2·s3)           ← interaction: code+misalign both high
+      + w_s1·s1   (if > 0)      ← NL bonus only, never penalises
+      + w_s4·(s4 - 0.5)·2  (if judges ran and s4 > 0.5)
+
+  p = sigmoid( k · (raw − bias) )
+
+Design properties:
+  • CMIA (s3) is the highest-weight primary signal — theoretically grounded,
+    obfuscation-invariant, lowest FP rate.
+  • NL score (s1) and judge score (s4) are ADDITIVE BONUSES only.
+    They cannot pull p downward — AV3 attacks with clean NL (s1≈0)
+    are handled naturally without any override.
+  • Interaction term s2·s3 captures "code is suspicious AND it diverges from
+    the NL description" as a jointly stronger signal.
+  • Weights and bias are transparent constants, clearly labelled as
+    PENDING CALIBRATION on SkillScan-1K. Once the dataset exists, replace
+    with logistic regression coefficients fitted on the validation split.
+
+Calibration targets (verify once SkillScan-1K is available):
+  All signals zero (clean benign)  → p ≈ 0.05
+  s3=0.5, s2=0.5 (moderate)       → p ≈ 0.40 (WARN boundary)
+  s3=0.7, s2=0.6, pl=0.5          → p ≈ 0.72 (REVIEW)
+  s3=0.8, s2=0.7, pl=0.8, s4=0.8  → p ≈ 0.93 (BLOCK)
+  AV3: s1=0, s3=0.7, s2=0.5, s4=0.75 → p ≈ 0.67 (REVIEW, no override needed)
 """
 from __future__ import annotations
 
 import math
-from typing import Optional
-
-from pydantic import BaseModel
 
 from .models import (
     CMIAScore, CodeThreatScore, JudgeVerdict, KillChain,
@@ -20,68 +54,58 @@ from .models import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Beta distribution likelihood parameters
+# Fusion weights — PENDING calibration on SkillScan-1K validation split.
+# Replace with logistic-regression coefficients once labelled data is available.
 # ─────────────────────────────────────────────────────────────────────────────
-# For each module i, we have Beta(alpha_pos, beta_pos) for malicious skills
-# and Beta(alpha_neg, beta_neg) for benign skills.
-# Parameters calibrated from domain knowledge:
-#   - malicious skills should have HIGH scores → Beta(8,2) (concentrated near 1)
-#   - benign skills should have LOW scores    → Beta(2,8) (concentrated near 0)
 
-_BETA_PARAMS = {
-    # module: (alpha_pos, beta_pos, alpha_neg, beta_neg)
-    # NOTE: m1 uses softer Beta(4,3) for the malicious class (mean≈0.57).
-    # Reason: AV3 (Semantic Camouflage) attacks deliberately keep SKILL.md clean,
-    # so malicious skills can have s1≈0. A concentrated Beta(7,2) would make
-    # s1=0 catastrophically penalise the malicious hypothesis even when code+CMIA
-    # signals are strong. This was validated against the evil-formatter test case.
-    "m1": (4.0, 3.0, 1.5, 9.0),   # NL threat — softer malicious prior for AV3 tolerance
-    "m2": (6.0, 2.5, 2.0, 8.0),   # Code threat — solid but more FP
-    "m3": (8.0, 1.5, 1.5, 9.5),   # CMIA — strongest discriminator (obfusc-invariant)
-    "m4": (7.5, 2.0, 2.0, 8.5),   # LLM panel — powerful but depends on LLM quality
-}
+# Phase 1 signals (deterministic, always present)
+_W_CMIA      = 0.40   # s3: primary signal, obfusc-invariant
+_W_CODE      = 0.25   # s2: code threat (pattern + behavioral)
+_W_PIPELINE  = 0.15   # s_pipeline: multi-step graph chains
+_W_PLUGIN    = 0.05   # s_plugin: supporting evidence
+_W_INTERACT  = 0.10   # s2 × s3: joint code+misalign signal
 
-PRIOR_P_MALICIOUS = 0.08   # ~8% of skills are malicious (from Wild Study)
+# Phase 2 signals (additive bonuses — only contribute when positive)
+_W_NL        = 0.10   # s1: NL consistency (Phase 2b), bonus only
+_W_JUDGES    = 0.15   # s4: judge consensus above neutral (Phase 2c)
+
+# Sigmoid parameters
+_K    = 7.0    # steepness
+_BIAS = 0.40   # decision-boundary raw score → p = 0.50 at raw = BIAS
 
 
-def _beta_log_pdf(x: float, alpha: float, beta: float) -> float:
-    """Log of Beta PDF at x (uses log-gamma for numerical stability)."""
-    # B(alpha, beta) = Gamma(alpha)*Gamma(beta)/Gamma(alpha+beta)
-    # PDF = x^(alpha-1) * (1-x)^(beta-1) / B(alpha, beta)
-    x = max(1e-9, min(1 - 1e-9, x))  # clamp to avoid log(0)
-    log_norm = math.lgamma(alpha + beta) - math.lgamma(alpha) - math.lgamma(beta)
-    return log_norm + (alpha - 1) * math.log(x) + (beta - 1) * math.log(1 - x)
-
-
-def bayesian_fuse(
-    s1: float,
-    s2: float,
-    s3: float,
-    s4: float,
+def fuse_scores(
+    s2:         float,
+    s3:         float,
+    s_pipeline: float,
+    s_plugin:   float,
+    s1:         float = 0.0,   # NL threat (Phase 2b); 0 if Phase 2 was skipped
+    s4:         float | None = None,  # judge consensus; None if Phase 2 skipped
 ) -> float:
     """
-    Compute P(M=1 | s1, s2, s3, s4) via Bayes' theorem.
-    Returns posterior probability of maliciousness.
+    Compute P(malicious) via calibrated weighted sigmoid fusion.
+
+    s1 is treated as an additive bonus (never penalises).
+    s4 only contributes when judges ran (s4 is not None) and agree malicious.
     """
-    log_prior_pos = math.log(PRIOR_P_MALICIOUS)
-    log_prior_neg = math.log(1.0 - PRIOR_P_MALICIOUS)
+    # Phase 1 core
+    raw = (
+        _W_CMIA     * s3
+      + _W_CODE     * s2
+      + _W_PIPELINE * s_pipeline
+      + _W_PLUGIN   * s_plugin
+      + _W_INTERACT * s2 * s3
+    )
 
-    scores = {"m1": s1, "m2": s2, "m3": s3, "m4": s4}
+    # Phase 2 additive bonuses
+    if s1 > 0.0:
+        raw += _W_NL * s1
 
-    log_pos = log_prior_pos
-    log_neg = log_prior_neg
+    if s4 is not None and s4 > 0.5:
+        # Normalise to [0, 1] range above neutral: (s4 - 0.5) * 2
+        raw += _W_JUDGES * (s4 - 0.5) * 2.0
 
-    for key, score in scores.items():
-        ap, bp, an, bn = _BETA_PARAMS[key]
-        log_pos += _beta_log_pdf(score, ap, bp)
-        log_neg += _beta_log_pdf(score, an, bn)
-
-    # Numerical stability: subtract max before exponentiation
-    log_max = max(log_pos, log_neg)
-    p_pos = math.exp(log_pos - log_max)
-    p_neg = math.exp(log_neg - log_max)
-
-    return round(p_pos / (p_pos + p_neg), 4)
+    return round(1.0 / (1.0 + math.exp(-_K * (raw - _BIAS))), 4)
 
 
 def score_to_verdict(p_malicious: float) -> Verdict:
@@ -228,34 +252,35 @@ def assemble_report(
     llm_calls:     int,
     errors:        list[str],
     injection_detected: bool,
+    static_findings: list | None = None,
+    pipeline_score: float = 0.0,
+    plugin_score: float = 0.0,
 ) -> PRISMReport:
 
     s1 = nl_score.overall
     s2 = code_score.overall
     s3 = cmia_score.overall
-    s4 = _judge_consensus_score(verdicts)
+    # s4: None when Phase 2 was skipped (verdicts=[]) so fusion treats it as absent
+    s4 = _judge_consensus_score(verdicts) if verdicts else None
 
-    p_malicious = bayesian_fuse(s1, s2, s3, s4)
-    verdict     = score_to_verdict(p_malicious)
+    p_malicious = fuse_scores(
+        s2=s2, s3=s3,
+        s_pipeline=pipeline_score,
+        s_plugin=plugin_score,
+        s1=s1,
+        s4=s4,
+    )
+    verdict = score_to_verdict(p_malicious)
 
-    # ── Hard override: Semantic Camouflage (AV3) ──────────────────────────────
-    # When code+CMIA signals are strong but NL is clean (s1≈0), the Bayesian
-    # product can underweight the posterior. Apply a floor when:
-    #   - At least one LLM judge flagged is_malicious=True
-    #   - AND (s2 > 0.3 OR s3 > 0.4)  [code or alignment anomaly]
-    # This floor (0.55) forces at least a WARN verdict for these "clean NL" cases.
-    judge_flagged = any(v.is_malicious for v in verdicts)
-    code_or_cmia_elevated = (s2 > 0.30 or s3 > 0.40)
-    if judge_flagged and code_or_cmia_elevated and p_malicious < 0.55:
-        p_malicious = max(p_malicious, 0.55)
-        verdict     = score_to_verdict(p_malicious)
-        errors.append("⚠ AV3 override applied: clean NL + elevated code/CMIA + judge flag")
-
-    # Boost p_malicious if prompt injection was attempted (strong signal itself)
+    # ── Injection override (phase 0 static detection) ──────────────────────
+    # Phase 0 already caused an early-exit BLOCK in scanner.py, but the flag
+    # is also stored here for report transparency.  If somehow assemble_report
+    # is called with injection_detected=True (e.g. LLM delimiter probe in 2c),
+    # we floor p to 0.97.
     if injection_detected:
-        p_malicious = min(1.0, p_malicious + 0.25)
+        p_malicious = max(p_malicious, 0.97)
         verdict     = score_to_verdict(p_malicious)
-        errors.append("⚠ PROMPT INJECTION ATTEMPT DETECTED in skill content")
+        errors.append("⚠ INJECTION DETECTED — p_malicious floored to 0.97")
 
     kill_chains = extract_kill_chains(nl_score, code_score, cmia_score, verdicts, p_malicious)
 
@@ -268,7 +293,11 @@ def assemble_report(
         s2_code_threat=round(s2, 3),
         s3_cmia=round(s3, 3),
         s4_llm_panel=round(s4, 3),
+        s_pipeline=round(pipeline_score, 3),
+        s_plugins=round(plugin_score, 3),
         p_malicious=p_malicious,
+        phase0_injection=injection_detected,
+        static_findings=static_findings or [],
         nl_threat_detail=nl_score,
         code_threat_detail=code_score,
         cmia_detail=cmia_score,

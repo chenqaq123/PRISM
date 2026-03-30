@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .models import PRISMReport, Verdict, Severity, KillChain, JudgeVerdict
+from .models import PRISMReport, Verdict, Severity, KillChain, JudgeVerdict, Finding
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,19 +52,51 @@ def print_report(report: PRISMReport) -> None:
     print(f"  {sev_str}    P(malicious) = {report.p_malicious:.3f}    "
           f"Confidence = {report.confidence:.2f}")
 
-    # ── Module scores ─────────────────────────────────────────────────────────
+    # ── Phase scores ──────────────────────────────────────────────────────────
     print(f"\n{SEP}")
-    print("  MODULE SCORES")
+    print("  PHASE SCORES")
     print(SEP)
-    print(f"  s1  NL Threat  (Module 1)  {_score_bar(report.s1_nl_threat)}")
-    print(f"  s2  Code Threat (Module 2)  {_score_bar(report.s2_code_threat)}")
-    print(f"  s3  CMIA       (Module 3)  {_score_bar(report.s3_cmia)}")
-    print(f"  s4  LLM Panel  (Module 4)  {_score_bar(report.s4_llm_panel)}")
+    print(f"  Phase 1a/1b  Code Threat (pattern+behavioral)  {_score_bar(report.s2_code_threat)}")
+    print(f"  Phase 1c     Pipeline Analysis                 {_score_bar(report.s_pipeline)}")
+    print(f"  Phase 1d     NL–Code Alignment (CMIA)          {_score_bar(report.s3_cmia)}")
+    print(f"  Phase 1e     Plugin Checks                     {_score_bar(report.s_plugins)}")
+    print(f"  Phase 2b     NL Consistency (LLM)              {_score_bar(report.s1_nl_threat)}")
+    print(f"  Phase 2c     Role Judges (LLM)                 {_score_bar(report.s4_llm_panel)}")
+
+    # ── Phase 0 injection flag ────────────────────────────────────────────────
+    if report.phase0_injection:
+        print(f"\n{SEP}")
+        print("  ⛔ PHASE 0: INJECTION DETECTED")
+        print(SEP)
+        print("  Static scan found prompt injection / instruction-override patterns.")
+        print("  Scan terminated early with automatic BLOCK verdict.")
+
+    # ── Static Findings (Phase 1) ─────────────────────────────────────────────
+    high_findings = [
+        f for f in report.static_findings
+        if f.severity in (Severity.CRITICAL, Severity.HIGH)
+    ]
+    if high_findings:
+        print(f"\n{SEP}")
+        print(f"  STATIC FINDINGS — Phase 1  ({len(report.static_findings)} total, "
+              f"{len(high_findings)} HIGH+)")
+        print(SEP)
+        for finding in high_findings[:8]:
+            sev_str = _SEV_STYLE.get(finding.severity, finding.severity.value)
+            verified = ""
+            if finding.llm_verified is True:
+                verified = "  ✓ LLM-confirmed"
+            elif finding.llm_verified is False:
+                verified = "  ✗ LLM: false positive"
+            print(f"  {sev_str}  [{finding.analyzer}]{verified}")
+            print(f"    {finding.description[:90]}")
+            if finding.llm_reasoning:
+                print(f"    └─ {finding.llm_reasoning[:80]}")
 
     # ── NL Threat Detail ─────────────────────────────────────────────────────
     if report.nl_threat_detail and report.nl_threat_detail.flagged_units:
         print(f"\n{SEP}")
-        print("  NL INSTRUCTION THREATS (Module 1)")
+        print("  NL INSTRUCTION THREATS — Phase 2b")
         print(SEP)
         nl = report.nl_threat_detail
         cats = [
@@ -87,7 +119,7 @@ def print_report(report: PRISMReport) -> None:
     # ── Code Threat Detail ────────────────────────────────────────────────────
     if report.code_threat_detail and report.code_threat_detail.top_findings:
         print(f"\n{SEP}")
-        print("  CODE THREATS (Module 2)")
+        print("  CODE THREATS — Phase 1a/1b")
         print(SEP)
         ct = report.code_threat_detail
         print(f"  Pattern Score:  {_score_bar(ct.pattern_score)}")
@@ -102,7 +134,7 @@ def print_report(report: PRISMReport) -> None:
     # ── CMIA Detail ───────────────────────────────────────────────────────────
     if report.cmia_detail and (report.cmia_detail.overall > 0.1 or report.cmia_detail.capability_gaps):
         print(f"\n{SEP}")
-        print("  CROSS-MODAL ALIGNMENT (Module 3)")
+        print("  NL–CODE ALIGNMENT — Phase 1d (CMIA)")
         print(SEP)
         cm = report.cmia_detail
         print(f"  CMIA Overall:   {_score_bar(cm.overall)}")
@@ -117,7 +149,7 @@ def print_report(report: PRISMReport) -> None:
     # ── LLM Panel Detail ──────────────────────────────────────────────────────
     if report.judge_verdicts:
         print(f"\n{SEP}")
-        print("  LLM PANEL VERDICTS (Module 4)")
+        print("  ROLE JUDGE VERDICTS — Phase 2c")
         print(SEP)
         for v in report.judge_verdicts:
             mal_icon = "⚠" if v.is_malicious else "✓"

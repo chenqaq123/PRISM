@@ -242,6 +242,52 @@ class KillChain(BaseModel):
     attack_strategy:   str       = ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 0 / Phase 1 data structures
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Finding(BaseModel):
+    """Individual finding from static analysis (Phase 1) or preprocessing (Phase 0)."""
+    severity:      Severity
+    category:      ThreatCategory
+    description:   str
+    file:          str   = ""
+    line:          int   = 0
+    analyzer:      str   = ""    # "pattern" | "behavioral" | "pipeline" | "cmia" | plugin name
+    # Set by Phase 2a LLM filter
+    llm_verified:  Optional[bool] = None
+    llm_reasoning: str   = ""
+
+
+@dataclass
+class InjectionResult:
+    """Result of Phase 0 static injection detection."""
+    detected:       bool
+    confidence:     float
+    patterns_found: list[str] = field(default_factory=list)
+    matched_texts:  list[str] = field(default_factory=list)
+
+
+class StaticAnalysisResult(BaseModel):
+    """Aggregated results from all Phase 1 static analyzers."""
+    findings:          list[Finding] = Field(default_factory=list)
+    pattern_score:     float = 0.0    # Phase 1a
+    behavioral_score:  float = 0.0    # Phase 1b
+    pipeline_score:    float = 0.0    # Phase 1c
+    alignment_score:   float = 0.0    # Phase 1d (CMIA)
+    plugin_findings:   list[Finding] = Field(default_factory=list)  # Phase 1e
+
+    @property
+    def overall(self) -> float:
+        # Composite score: max of individual scores, with behavioral and pipeline weighted
+        return round(min(1.0, max(
+            self.pattern_score,
+            self.behavioral_score,
+            self.pipeline_score * 0.9,
+            self.alignment_score * 0.85,
+        )), 3)
+
+
 class PRISMReport(BaseModel):
     """Final PRISM scan report."""
     skill_name:      str
@@ -249,14 +295,22 @@ class PRISMReport(BaseModel):
     verdict:         Verdict
     confidence:      float
 
-    # Per-module scores
-    s1_nl_threat:    float   # Module 1
-    s2_code_threat:  float   # Module 2
-    s3_cmia:         float   # Module 3
-    s4_llm_panel:    float   # Module 4
+    # Per-phase/module scores
+    s1_nl_threat:    float   # Phase 2b — NL consistency (LLM)
+    s2_code_threat:  float   # Phase 1a+1b — pattern + behavioral
+    s3_cmia:         float   # Phase 1d — cross-modal alignment
+    s4_llm_panel:    float   # Phase 2c — role judges
+    s_pipeline:      float = 0.0  # Phase 1c — pipeline analysis
+    s_plugins:       float = 0.0  # Phase 1e — plugin findings
 
     # Posterior probability
     p_malicious:     float
+
+    # Phase 0 result
+    phase0_injection:   bool  = False
+
+    # Phase 1 static findings
+    static_findings:    list[Finding]              = Field(default_factory=list)
 
     # Detailed results
     nl_threat_detail:   Optional[NLThreatScore]    = None
