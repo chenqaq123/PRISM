@@ -1,0 +1,9 @@
+ref/
+deleted/
+skill-examples/
+results/
+PAPER_DESIGN_v4.md
+.env
+*.json
+*.md
+.DS_Store
