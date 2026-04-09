@@ -143,6 +143,10 @@ class InstructionUnit(BaseModel):
     is_conditional:   bool  = False
     is_explicit:      bool  = Field(True, description="Whether the operation is clearly named (not vague)")
     scope_vs_manifest: float = Field(1.0, description="0-1: how consistent with frontmatter scope (1=consistent)")
+    command:          str   = Field("", description="Exact script/command invoked, e.g. 'scripts/init_skill.py', 'git commit'. Empty if not a subprocess/script call.")
+    target:           str   = Field("", description="Primary file path, URL, or resource this step operates on. Empty if not applicable.")
+    skip_to_step:     int   = Field(0, description="For condition nodes only: step_index of the first step to execute when condition is FALSE or skipped. 0 = no branch (condition always executes next step).")
+    parent_step:      int   = Field(0, description="step_index of the parent step this belongs to. 0 = top-level step (no parent).")
 
 
 class NLCapabilitySet(BaseModel):
@@ -286,6 +290,55 @@ class StaticAnalysisResult(BaseModel):
             self.pipeline_score * 0.9,
             self.alignment_score * 0.85,
         )), 3)
+
+
+class WorkflowExtract(BaseModel):
+    """Serializable form of the LLM-extracted workflow (Phase 0 output)."""
+    declared_purpose:  str
+    instruction_units: list[InstructionUnit]
+    frontmatter_scope: str = ""
+
+
+class Phase1Result(BaseModel):
+    """
+    Complete output of Phase 1 (cloud-side scan).
+    JSON-serializable — can be saved to disk and loaded on the user's machine
+    before running Phase 2 judges.
+    """
+    # ── Identity ──────────────────────────────────────────────────────────────
+    skill_name: str
+    skill_dir:  str
+
+    # ── Phase 0 ───────────────────────────────────────────────────────────────
+    injection_detected: bool = False
+
+    # ── Phase 1 scores ────────────────────────────────────────────────────────
+    code_score:     CodeThreatScore
+    cmia_score:     CMIAScore
+    pipeline_score: float = 0.0
+    plugin_score:   float = 0.0
+    fast_p:         float = 0.0   # Phase-2 gate estimate
+
+    # ── Findings ──────────────────────────────────────────────────────────────
+    static_findings:      list[Finding] = Field(default_factory=list)
+    pipeline_findings_desc: list[str]   = Field(default_factory=list)
+
+    # ── Capability sets (passed to Phase-2 judge context) ─────────────────────
+    nl_caps:   NLCapabilitySet
+    code_caps: CodeCapabilitySet
+
+    # ── NL workflow extract (needed by Phase-2b NL consistency) ───────────────
+    wf_extract: Optional[WorkflowExtract] = None
+    frontmatter: dict = Field(default_factory=dict)
+
+    # ── Pre-serialized HASG context string (for Phase-2c judges) ─────────────
+    # Computed at Phase 1 time via serialize_hasg(); Phase 2 appends nl_score.
+    hasg_context_base: str = ""
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    scan_duration_phase1: float     = 0.0
+    llm_calls_phase1:     int       = 0
+    errors:               list[str] = Field(default_factory=list)
 
 
 class PRISMReport(BaseModel):

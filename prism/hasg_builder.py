@@ -22,10 +22,10 @@ from typing import Optional
 import yaml
 from pydantic import BaseModel
 
-from .llm_client import chat_structured
+from .llm_client import chat_structured_cloud
 from .models import (
     HASG, HAsgEdge, HAsgEdgeType, HAsgNode, HAsgNodeType,
-    NLCapabilitySet, CodeCapabilitySet, InstructionUnit,
+    NLCapabilitySet, CodeCapabilitySet, InstructionUnit, WorkflowExtract,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,11 +50,8 @@ OBFUSC_ENCODING_RE = re.compile(
 # Step 1: Parse SKILL.md → NL nodes
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _WorkflowExtract(BaseModel):
-    """LLM extraction of workflow from SKILL.md."""
-    declared_purpose: str
-    instruction_units: list[InstructionUnit]
-    frontmatter_scope: str = ""   # declared scope from frontmatter
+# Alias for backward compat within this module
+_WorkflowExtract = WorkflowExtract   # declared scope from frontmatter
 
 
 def parse_skill_md(skill_dir: Path) -> tuple[dict, _WorkflowExtract]:
@@ -72,24 +69,132 @@ def parse_skill_md(skill_dir: Path) -> tuple[dict, _WorkflowExtract]:
         frontmatter = yaml.safe_load(fm_match.group(1)) or {}
 
     prompt = f"""\
-You are a security analyst. Extract ALL workflow steps from this SKILL.md.
+You are a security analyst building an atomic action graph from a SKILL.md file.
+Your job is to extract EVERY distinct operation as a separate node.
 
-For each step, identify:
-- action_type: file_op / net_op / subprocess / agent_capability / display / condition / other
-- resource_scope: what resource it touches (e.g. "project_dir", "~/.ssh", "external_api")
-- is_explicit: is the operation clearly named (True) or vaguely described (False)?
-- scope_vs_manifest: 0.0-1.0, how consistent is this step with the declared frontmatter scope
+## Extraction Rules
 
-Also provide:
-- declared_purpose: 1-2 sentence summary of what the skill claims to do
-- frontmatter_scope: the scope declared in the frontmatter (e.g. "project directory", "user home")
+### Granularity — CRITICAL
+Extract at the ATOMIC ACTION level. One node = one distinct operation.
+NEVER merge two actions into one node, even if they appear in the same sentence.
 
-SKILL.md content:
----
+### What counts as a separate node
+1. **Every code block** — each line in a ```bash``` or ```python``` block that contains
+   a command invocation is a SEPARATE node. Scan ALL code blocks in the document.
+2. **Every script call** — `scripts/init_skill.py`, `scripts/quick_validate.py`,
+   `scripts/generate_openai_yaml.py`, etc. — each is its own node.
+3. **Every shell command** — `git commit`, `pip install`, `curl`, etc.
+4. **Every explicit file read** — "read references/openai_yaml.md", "load references/schema.md"
+5. **Every explicit file write or create** — "write SKILL.md", "create agents/openai.yaml"
+6. **Every conditional branch** — "if/when/unless/skip if…"
+7. **Every agent capability** — asking user questions, generating values, making decisions
+8. **Every output inspection** — checking validation output, viewing generated files
+
+### What to SKIP — CRITICAL
+NEVER extract structural descriptions, documentation, or reference material as operations.
+These are NOT actions the skill performs:
+- Directory/file tree diagrams showing "what a skill contains" (e.g. `skill-name/ ├── SKILL.md ├── scripts/ …`)
+- "Anatomy of a Skill" sections — these describe the FORMAT, not operations
+- Definitions like "SKILL.md has YAML frontmatter" or "agents/ stores openai.yaml"
+- "references/ contains documentation" — this is just describing what a folder is FOR
+- "file_op" only means the skill actually READS or WRITES a file as part of its WORKFLOW
+  — NOT that a file exists in the directory structure
+- Feature lists, permission tables, metadata descriptions
+- Anything that describes "what something is" rather than "what to do"
+
+The key question: **Does the skill actually perform this action when it runs?**
+If the answer is "no, this just describes a file/format" — SKIP IT.
+
+### High-level steps must be SPLIT
+A bullet like "Initialize the skill (run init_skill.py)" is NOT one node.
+It becomes TWO nodes:
+  - node A: "Initialize the skill" (action_type=other, no command)
+  - node B: "scripts/init_skill.py <skill-name> --path <dir>" (action_type=subprocess, command="scripts/init_skill.py")
+
+### action_type values (always pick the most specific)
+- "subprocess"        — script invocation or any shell/bash command
+- "file_op"           — the skill actually READS, WRITES, CREATES, or DELETES a file/dir as part of its workflow. NOT just "a file exists in this directory"
+- "net_op"            — HTTP request, API call, download, upload
+- "agent_capability"  — asking user, generating content, making a decision, reasoning
+- "display"           — inspecting output, viewing content, validation result
+- "condition"         — if/when/unless/skip-if branch (conditional gate)
+- "other"             — narrative goal or context with no concrete operation
+
+### command field
+For subprocess/file_op/net_op: the EXACT command/script/path as written in the doc.
+Examples: "scripts/init_skill.py", "scripts/quick_validate.py <path>",
+"scripts/generate_openai_yaml.py <path> --interface key=value", "git commit".
+Leave "" for agent_capability/display/condition/other.
+
+### target field
+Primary resource operated on: file path, URL, directory name, variable.
+Examples: "references/openai_yaml.md", "agents/openai.yaml", "skills/public/".
+Leave "" if not applicable.
+
+### skip_to_step field — CRITICAL for condition nodes
+For every node with action_type == "condition", you MUST set `skip_to_step` to the
+step_index of the FIRST step that runs when the condition is FALSE or the branch is skipped.
+
+Think of it as: the graph has a DIAMOND shape at each condition.
+- The "true" edge goes to step_index + 1 (the body of the branch)
+- The "false/skip" edge goes to `skip_to_step` (after the body ends)
+
+Example: if step 5 is "If validation fails, fix issues", and steps 6-7 are the fix
+actions, and step 8 is the next unrelated step — then skip_to_step = 8.
+
+Another example: "Skip this step only if skill already exists (step 3)" — if step 2
+is this condition, and step 3 is what to skip, and step 4 comes after — skip_to_step = 4.
+
+For all non-condition nodes, skip_to_step = 0.
+
+### parent_step field — CRITICAL for hierarchical structure
+Most SKILL.md documents have a hierarchical structure: top-level phases/sections
+contain sub-steps. You MUST set `parent_step` to capture this hierarchy.
+
+- **Top-level steps** (major phases, numbered sections, main headings): parent_step = 0
+- **Sub-steps** nested under a section: parent_step = step_index of the parent section
+
+Example document structure:
+```
+## 1. Understand the skill        → step 1, parent_step=0 (top-level)
+  - Ask user what it does          → step 2, parent_step=1 (child of step 1)
+  - Ask for examples               → step 3, parent_step=1 (child of step 1)
+## 2. Initialize                   → step 4, parent_step=0 (top-level)
+  - Run scripts/init_skill.py      → step 5, parent_step=4 (child of step 4)
+  - Create SKILL.md template       → step 6, parent_step=4 (child of step 4)
+## 3. Validate                     → step 7, parent_step=0 (top-level)
+  - Run scripts/quick_validate.py  → step 8, parent_step=7 (child of step 7)
+```
+
+Rules:
+- A heading or numbered section title is always a top-level step (parent_step=0).
+- Bullet points, sub-bullets, code blocks UNDER a section are children (parent_step = that section's step_index).
+- If a step is indented or logically subordinate to another, it is a child.
+- Deeply nested items: use the IMMEDIATE parent, not the grandparent.
+
+## Output Format
+
+Return a JSON object:
+- "declared_purpose": 1-2 sentence summary of what the skill claims to do
+- "frontmatter_scope": scope from frontmatter (e.g. "project directory")
+- "instruction_units": list of ALL atomic nodes found (empty [] if none). Each:
+  - "step_index": sequential integer starting at 1
+  - "text": verbatim or close paraphrase of THIS specific atomic action
+  - "action_type": one of the seven types above
+  - "resource_scope": "project_dir" | "local_tool" | "external_api" | "user_home" | "stdin" | other
+  - "command": exact script/command string or ""
+  - "target": primary file/URL/resource or ""
+  - "skip_to_step": for condition nodes — step_index to jump to when FALSE; else 0
+  - "parent_step": step_index of the parent section/phase this belongs to; 0 = top-level
+  - "is_conditional": true if guarded by if/when/unless/skip
+  - "is_explicit": true if clearly named (false if vague)
+  - "scope_vs_manifest": float 0.0-1.0 consistency with frontmatter scope
+
+## SKILL.md Content
+
 {content}
----
 """
-    result = chat_structured(
+    result = chat_structured_cloud(
         messages=[
             {"role": "system", "content": "You analyze AI agent skill definition files for security research."},
             {"role": "user", "content": prompt},
@@ -602,6 +707,73 @@ def _is_declared_in_nl(op: _RawCodeOp, nl_caps: NLCapabilitySet) -> bool:
     return True
 
 
+def _add_nl_flow_edges(graph: HASG, nl_nodes: list[HAsgNode]) -> None:
+    """
+    Add NL_FLOW edges respecting parent-child hierarchy and condition branches.
+
+    Edge structure:
+      - Top-level nodes (parent_step=0): sequential next edges among siblings
+      - Parent → first child: "enter" edge
+      - Children of the same parent: sequential "next" edges among siblings
+      - Condition nodes: "true" / "skip" branching edges
+    """
+    if not nl_nodes:
+        return
+
+    # Build step_index → node lookup
+    step_map: dict[int, HAsgNode] = {n.line: n for n in nl_nodes}
+
+    # Group nodes by parent_step
+    children_of: dict[int, list[HAsgNode]] = {}  # parent_step → [child nodes in order]
+    for node in nl_nodes:
+        parent = node.features.get("parent_step", 0) or 0
+        children_of.setdefault(parent, []).append(node)
+
+    # Wire edges within each sibling group
+    for parent_step, siblings in children_of.items():
+        # Parent → first child ("enter" edge)
+        if parent_step != 0:
+            parent_node = step_map.get(parent_step)
+            if parent_node and siblings:
+                graph.add_edge(HAsgEdge(
+                    from_id=parent_node.id, to_id=siblings[0].id,
+                    edge_type=HAsgEdgeType.NL_FLOW, label="enter",
+                ))
+
+        # Sequential edges among siblings
+        for i, node in enumerate(siblings[:-1]):
+            next_node = siblings[i + 1]
+            skip_to   = node.features.get("skip_to_step", 0) or 0
+
+            if node.features.get("action_type") == "condition" and skip_to > 0:
+                # True branch → immediate next sibling
+                graph.add_edge(HAsgEdge(
+                    from_id=node.id, to_id=next_node.id,
+                    edge_type=HAsgEdgeType.NL_FLOW, label="true",
+                ))
+                # Skip/false branch → skip_to_step node
+                skip_node = step_map.get(skip_to)
+                if skip_node and skip_node.id != next_node.id:
+                    graph.add_edge(HAsgEdge(
+                        from_id=node.id, to_id=skip_node.id,
+                        edge_type=HAsgEdgeType.NL_FLOW, label="skip",
+                    ))
+            else:
+                graph.add_edge(HAsgEdge(
+                    from_id=node.id, to_id=next_node.id,
+                    edge_type=HAsgEdgeType.NL_FLOW, label="next",
+                ))
+
+
+def _cmd_label(unit) -> str:
+    """Return a concise display label: command if present, else text."""
+    cmd = getattr(unit, "command", "") or ""
+    if cmd:
+        tgt = getattr(unit, "target", "") or ""
+        return f"{cmd} {tgt}".strip()
+    return ""
+
+
 def build_hasg(skill_dir: Path) -> tuple[HASG, _WorkflowExtract, NLCapabilitySet, CodeCapabilitySet]:
     """
     Main builder function.
@@ -632,7 +804,7 @@ def build_hasg(skill_dir: Path) -> tuple[HASG, _WorkflowExtract, NLCapabilitySet
         node = HAsgNode(
             id=new_id("nl"),
             node_type=ntype,
-            label=unit.text[:80],
+            label=(_cmd_label(unit) or unit.text)[:80],
             file="SKILL.md",
             line=unit.step_index,
             features={
@@ -640,17 +812,17 @@ def build_hasg(skill_dir: Path) -> tuple[HASG, _WorkflowExtract, NLCapabilitySet
                 "resource_scope":    unit.resource_scope,
                 "is_explicit":       unit.is_explicit,
                 "scope_vs_manifest": unit.scope_vs_manifest,
+                "command":           getattr(unit, "command",       "") or "",
+                "target":            getattr(unit, "target",        "") or "",
+                "skip_to_step":      getattr(unit, "skip_to_step",  0)  or 0,
+                "parent_step":       getattr(unit, "parent_step",   0)  or 0,
             },
         )
         graph.add_node(node)
         nl_nodes.append(node)
 
-    # Add sequential NL_FLOW edges
-    for i in range(len(nl_nodes) - 1):
-        graph.add_edge(HAsgEdge(
-            from_id=nl_nodes[i].id, to_id=nl_nodes[i + 1].id,
-            edge_type=HAsgEdgeType.NL_FLOW, label="next",
-        ))
+    # NL_FLOW edges — hierarchical parent-child + sibling sequential
+    _add_nl_flow_edges(graph, nl_nodes)
 
     # ── 2. Analyse code artifacts ────────────────────────────────────────────
     all_ops: list[_RawCodeOp] = []
@@ -804,6 +976,58 @@ def build_hasg(skill_dir: Path) -> tuple[HASG, _WorkflowExtract, NLCapabilitySet
                     ))
 
     return graph, wf_extract, nl_caps, code_caps
+
+
+def build_nl_graph(skill_dir: Path) -> tuple[HASG, _WorkflowExtract, NLCapabilitySet]:
+    """
+    Build HASG from SKILL.md only — no code analysis.
+    Returns (graph, wf_extract, nl_caps).
+    Useful for inspecting NL node extraction accuracy in isolation.
+    """
+    graph = HASG(skill_name=skill_dir.name, skill_dir=str(skill_dir))
+    counter = {"n": 0}
+
+    def new_id(prefix: str) -> str:
+        counter["n"] += 1
+        return f"{prefix}:{counter['n']}"
+
+    frontmatter, wf_extract = parse_skill_md(skill_dir)
+    graph.skill_name = frontmatter.get("name", skill_dir.name)
+
+    nl_nodes: list[HAsgNode] = []
+    for unit in wf_extract.instruction_units:
+        if unit.is_conditional:
+            ntype = HAsgNodeType.NL_TRIGGER
+        elif unit.action_type == "agent_capability":
+            ntype = HAsgNodeType.NL_AGENT_CALL
+        else:
+            ntype = HAsgNodeType.NL_DIRECTIVE
+
+        node = HAsgNode(
+            id=new_id("nl"),
+            node_type=ntype,
+            label=(_cmd_label(unit) or unit.text)[:80],
+            file="SKILL.md",
+            line=unit.step_index,
+            features={
+                "action_type":       unit.action_type,
+                "resource_scope":    unit.resource_scope,
+                "is_explicit":       unit.is_explicit,
+                "scope_vs_manifest": unit.scope_vs_manifest,
+                "command":           getattr(unit, "command",       "") or "",
+                "target":            getattr(unit, "target",        "") or "",
+                "skip_to_step":      getattr(unit, "skip_to_step",  0)  or 0,
+                "parent_step":       getattr(unit, "parent_step",   0)  or 0,
+            },
+        )
+        graph.add_node(node)
+        nl_nodes.append(node)
+
+    # NL_FLOW edges — hierarchical parent-child + sibling sequential
+    _add_nl_flow_edges(graph, nl_nodes)
+
+    nl_caps = _extract_nl_capabilities(wf_extract)
+    return graph, wf_extract, nl_caps
 
 
 def _extract_nl_capabilities(wf: _WorkflowExtract) -> NLCapabilitySet:

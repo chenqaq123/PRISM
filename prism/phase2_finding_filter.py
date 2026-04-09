@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from .llm_client import chat_structured
+from .llm_client import chat_structured_judge as chat_structured
 from .models import Finding, Severity
 
 

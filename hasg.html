@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PRISM HASG — skill-creator</title>
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/dist/vis-network.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif; height: 100vh; display: flex; flex-direction: column; }
+  #header {
+    padding: 10px 18px; background: #16213e;
+    border-bottom: 2px solid #0f3460;
+    display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+  }
+  #header h1 { font-size: 1.1rem; color: #e2e2e2; }
+  .badge { padding: 3px 10px; border-radius: 12px; font-size: 0.78rem; font-weight: bold; }
+  .badge-info { background: #0f3460; color: #90caf9; }
+  .badge-warn { background: #e65100; color: #fff; }
+  .badge-danger { background: #b71c1c; color: #fff; }
+  #main { display: flex; flex: 1; overflow: hidden; }
+  #network { flex: 1; }
+  #sidebar {
+    width: 240px; background: #16213e; border-left: 1px solid #0f3460;
+    overflow-y: auto; padding: 12px; flex-shrink: 0;
+  }
+  #legend { font-size: 0.78rem; }
+  .leg-item { display: flex; align-items: center; gap: 7px; margin: 5px 0; }
+  .leg-dot { width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0; }
+  .leg-line { width: 22px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+  #info-panel { margin-top: 16px; font-size: 0.78rem; border-top: 1px solid #0f3460; padding-top: 10px; }
+  #info-panel h3 { font-size: 0.82rem; margin-bottom: 6px; color: #90caf9; }
+  #node-detail { color: #ccc; line-height: 1.5; }
+  #controls { margin-bottom: 12px; border-bottom: 1px solid #0f3460; padding-bottom: 10px; }
+  #controls button {
+    display: block; width: 100%; margin: 4px 0;
+    padding: 5px 8px; background: #0f3460; border: none;
+    color: #90caf9; border-radius: 4px; cursor: pointer; font-size: 0.78rem;
+  }
+  #controls button:hover { background: #1a4a8a; }
+</style>
+</head>
+<body>
+<div id="header">
+  <h1>PRISM HASG — skill-creator</h1>
+  <span class="badge badge-info">13 nodes</span>
+  <span class="badge badge-info">9 edges</span>
+  
+  
+</div>
+<div id="main">
+  <div id="network"></div>
+  <div id="sidebar">
+    <div id="controls">
+      <b style="font-size:0.8rem">Controls</b>
+      <button onclick="network.fit()">⟳ Fit all</button>
+      <button onclick="togglePhysics()">⚙ Toggle physics</button>
+    </div>
+    
+    <div id="legend">
+      <b>Nodes</b>
+      <div class="leg-item"><span class="leg-dot" style="background:#4A90D9;border:2px solid #2C6FAC"></span>NL-Dir</div><div class="leg-item"><span class="leg-dot" style="background:#9B59B6;border:2px solid #6C3483"></span>NL-Trig</div><div class="leg-item"><span class="leg-dot" style="background:#1ABC9C;border:2px solid #148F77"></span>NL-Agent</div><div class="leg-item"><span class="leg-dot" style="background:#2ECC71;border:2px solid #1A8A4A"></span>CodeBlock</div><div class="leg-item"><span class="leg-dot" style="background:#E74C3C;border:2px solid #A93226"></span>SysOp</div><div class="leg-item"><span class="leg-dot" style="background:#E67E22;border:2px solid #A04000"></span>NetOp</div><div class="leg-item"><span class="leg-dot" style="background:#F39C12;border:2px solid #9A6300"></span>IOOp</div><div class="leg-item"><span class="leg-dot" style="background:#EC407A;border:2px solid #AD1457"></span>EnvOp</div><div class="leg-item"><span class="leg-dot" style="background:#95A5A6;border:2px solid #626567"></span>Perm</div>
+      <hr style="border-color:#444;margin:8px 0">
+      <b>Edges</b>
+      <div class="leg-item"><span class="leg-line" style="background:#4A90D9;opacity:1"></span>nl_flow</div><div class="leg-item"><span class="leg-line" style="background:#1ABC9C;opacity:0.5"></span>~ nl_invokes</div><div class="leg-item"><span class="leg-line" style="background:#2ECC71;opacity:1"></span>ctrl_flow</div><div class="leg-item"><span class="leg-line" style="background:#00BCD4;opacity:0.5"></span>~ data_flow</div><div class="leg-item"><span class="leg-line" style="background:#FF9800;opacity:0.5"></span>~ taint</div><div class="leg-item"><span class="leg-line" style="background:#95A5A6;opacity:0.5"></span>~ covers</div><div class="leg-item"><span class="leg-line" style="background:#E74C3C;opacity:0.5"></span>~ misalign</div>
+    </div>
+    <div id="info-panel">
+      <h3>Node detail</h3>
+      <div id="node-detail">Click a node to inspect</div>
+    </div>
+  </div>
+</div>
+<script>
+const nodesData = [{"id": "nl:1", "label": "Understand the skill with…", "title": "<b>NL-Dir</b><br>Label: Understand the skill with concrete examples<br>File: SKILL.md:1<br>Risk: 0.00<br>action_type: other<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "nl:2", "label": "Plan reusable skill…", "title": "<b>NL-Dir</b><br>Label: Plan reusable skill contents (scripts, references, assets)<br>File: SKILL.md:2<br>Risk: 0.00<br>action_type: other<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "nl:3", "label": "Initialize the skill (run…", "title": "<b>NL-Dir</b><br>Label: Initialize the skill (run init_skill.py)<br>File: SKILL.md:3<br>Risk: 0.00<br>action_type: subprocess<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "nl:4", "label": "Edit the skill (implement…", "title": "<b>NL-Dir</b><br>Label: Edit the skill (implement resources and write SKILL.md)<br>File: SKILL.md:4<br>Risk: 0.00<br>action_type: other<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "nl:5", "label": "Validate the skill (run…", "title": "<b>NL-Dir</b><br>Label: Validate the skill (run quick_validate.py)<br>File: SKILL.md:5<br>Risk: 0.00<br>action_type: subprocess<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "nl:6", "label": "Iterate based on real usage", "title": "<b>NL-Dir</b><br>Label: Iterate based on real usage<br>File: SKILL.md:6<br>Risk: 0.00<br>action_type: other<br>resource_scope: local_tool<br>is_explicit: True<br>scope_vs_manifest: 1.0", "color": {"background": "#4A90D9", "border": "#2C6FAC", "highlight": {"background": "#fff", "border": "#2C6FAC"}}, "font": {"color": "#fff", "size": 13}, "size": 20, "group": "nl_directive", "shape": "ellipse"}, {"id": "code:7", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/generate_openai_yaml.py:109<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:8", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/generate_openai_yaml.py:185<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:9", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/init_skill.py:237<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:10", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/init_skill.py:245<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:11", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/init_skill.py:252<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:12", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/init_skill.py:293<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}, {"id": "code:13", "label": "read(...))", "title": "<b>IOOp</b><br>Label: read(...))<br>File: /Users/cgx/Desktop/cgx_nas/Agent/Skill-Detection/skill-examples/skill-creator/scripts/quick_validate.py:23<br>Risk: 0.25", "color": {"background": "#F39C12", "border": "#9A6300", "highlight": {"background": "#fff", "border": "#9A6300"}}, "font": {"color": "#222", "size": 13}, "size": 26, "group": "io_op", "shape": "box"}];
+const edgesData = [{"id": 0, "from": "nl:1", "to": "nl:2", "label": "nl_flow", "title": "<b>nl_flow</b><br>next", "color": {"color": "#4A90D9", "highlight": "#4A90D9"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#4A90D9", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 1, "from": "nl:2", "to": "nl:3", "label": "nl_flow", "title": "<b>nl_flow</b><br>next", "color": {"color": "#4A90D9", "highlight": "#4A90D9"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#4A90D9", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 2, "from": "nl:3", "to": "nl:4", "label": "nl_flow", "title": "<b>nl_flow</b><br>next", "color": {"color": "#4A90D9", "highlight": "#4A90D9"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#4A90D9", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 3, "from": "nl:4", "to": "nl:5", "label": "nl_flow", "title": "<b>nl_flow</b><br>next", "color": {"color": "#4A90D9", "highlight": "#4A90D9"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#4A90D9", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 4, "from": "nl:5", "to": "nl:6", "label": "nl_flow", "title": "<b>nl_flow</b><br>next", "color": {"color": "#4A90D9", "highlight": "#4A90D9"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#4A90D9", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 5, "from": "code:7", "to": "code:8", "label": "ctrl_flow", "title": "<b>ctrl_flow</b><br>seq", "color": {"color": "#2ECC71", "highlight": "#2ECC71"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#2ECC71", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 6, "from": "code:9", "to": "code:10", "label": "ctrl_flow", "title": "<b>ctrl_flow</b><br>seq", "color": {"color": "#2ECC71", "highlight": "#2ECC71"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#2ECC71", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 7, "from": "code:10", "to": "code:11", "label": "ctrl_flow", "title": "<b>ctrl_flow</b><br>seq", "color": {"color": "#2ECC71", "highlight": "#2ECC71"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#2ECC71", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}, {"id": 8, "from": "code:11", "to": "code:12", "label": "ctrl_flow", "title": "<b>ctrl_flow</b><br>seq", "color": {"color": "#2ECC71", "highlight": "#2ECC71"}, "dashes": false, "width": 2, "arrows": "to", "font": {"size": 10, "color": "#2ECC71", "strokeWidth": 0}, "smooth": {"type": "curvedCW", "roundness": 0.15}}];
+
+const container = document.getElementById('network');
+const data = {
+  nodes: new vis.DataSet(nodesData),
+  edges: new vis.DataSet(edgesData),
+};
+const options = {
+  physics: {
+    enabled: true,
+    solver: 'forceAtlas2Based',
+    forceAtlas2Based: { gravitationalConstant: -60, springLength: 120, springConstant: 0.08 },
+    stabilization: { iterations: 250 },
+  },
+  interaction: { hover: true, tooltipDelay: 100, navigationButtons: true, keyboard: true },
+  edges: { font: { align: 'middle' }, selectionWidth: 2 },
+};
+const network = new vis.Network(container, data, options);
+
+let physicsOn = true;
+function togglePhysics() {
+  physicsOn = !physicsOn;
+  network.setOptions({ physics: { enabled: physicsOn } });
+}
+
+// Node click → detail panel
+const nodeMap = Object.fromEntries(nodesData.map(n => [n.id, n]));
+network.on('click', params => {
+  if (!params.nodes.length) return;
+  const n = nodeMap[params.nodes[0]];
+  if (!n) return;
+  document.getElementById('node-detail').innerHTML =
+    (n.title || '').replace(/<br>/g, '\n')
+      .replace(/<[^>]+>/g, '')
+      .split('\n')
+      .map(l => `<div>${l}</div>`)
+      .join('');
+});
+</script>
+</body>
+</html>

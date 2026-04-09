@@ -11,8 +11,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .llm_client import chat_structured
-from .hasg_builder import HASG, serialize_hasg, _WorkflowExtract
+from .llm_client import chat_structured_judge as chat_structured
+from .hasg_builder import HASG, serialize_hasg
+from .models import WorkflowExtract as _WorkflowExtract
 from .models import (
     JudgeVerdict, NLCapabilitySet, CodeCapabilitySet,
     NLThreatScore, CodeThreatScore, CMIAScore,
@@ -160,13 +161,14 @@ Based on the above skill content and structural analysis, provide your security 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_llm_panel(
-    skill_dir: Path,
-    graph: HASG,
-    nl_caps: NLCapabilitySet,
-    code_caps: CodeCapabilitySet,
-    nl_score:   NLThreatScore,
-    code_score: CodeThreatScore,
-    cmia_score: CMIAScore,
+    skill_dir:         Path,
+    graph:             HASG | None,
+    nl_caps:           NLCapabilitySet | None,
+    code_caps:         CodeCapabilitySet | None,
+    nl_score:          NLThreatScore,
+    code_score:        CodeThreatScore,
+    cmia_score:        CMIAScore,
+    hasg_context_base: str | None = None,
 ) -> tuple[list[JudgeVerdict], bool]:
     """
     Run the three-judge LLM panel.
@@ -185,8 +187,23 @@ def run_llm_panel(
         "kill_chain": nl_score.kill_chain_description if nl_score.kill_chain_detected else None,
     }
 
-    # Serialize HASG as structured context
-    hasg_context = serialize_hasg(graph, nl_caps, code_caps, phase1_summary)
+    # Build HASG context: use pre-serialized base from Phase 1 if available,
+    # otherwise fall back to full serialization (when both phases run together).
+    if hasg_context_base:
+        p2b_supplement = (
+            f"\n\n### Phase 2b Update\n"
+            f"- NL Threat Score (s1): {nl_score.overall:.2f}"
+        )
+        if nl_score.kill_chain_detected:
+            p2b_supplement += f"\n- Kill chain detected: {nl_score.kill_chain_description[:80]}"
+        if nl_score.flagged_units:
+            p2b_supplement += "\n- Flagged NL patterns: " + "; ".join(
+                f"Step {u['step_index']} ({u['category']}): {u['text'][:50]}"
+                for u in nl_score.flagged_units[:3]
+            )
+        hasg_context = hasg_context_base + p2b_supplement
+    else:
+        hasg_context = serialize_hasg(graph, nl_caps, code_caps, phase1_summary)
 
     # Read raw skill content for judges
     skill_md = skill_dir / "SKILL.md"

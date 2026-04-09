@@ -16,33 +16,47 @@ The previous naive-Bayes (Beta-likelihood) formulation was replaced because:
      suppressing the posterior even when s2, s3 are high) required a separate
      hard override — a symptom that the model was wrong.
 
-Replacement: calibrated weighted sigmoid
+Replacement: multi-pathway max + combined sigmoid
 ─────────────────────────────────────────────────────────────────────────────
-  raw = w_s3·s3 + w_s2·s2 + w_pl·s_pipeline + w_pk·s_plugin
-      + w_int·(s2·s3)           ← interaction: code+misalign both high
-      + w_s1·s1   (if > 0)      ← NL bonus only, never penalises
-      + w_s4·(s4 - 0.5)·2  (if judges ran and s4 > 0.5)
+Each attack vector (code, NL, alignment, pipeline) has its OWN sigmoid
+pathway that can independently trigger a WARN/REVIEW/BLOCK verdict.
+A final "combined" score captures multi-signal synergy.
 
-  p = sigmoid( k · (raw − bias) )
+  p = max(p_code, p_align, p_pipeline, p_plugin, p_nl, p_combined)
+
+Pathway signals:
+  p_code     = sig(s2,        bias=0.55)   — pure code threat (T1–T9)
+  p_align    = sig(s3,        bias=0.55)   — NL–code misalignment (CMIA)
+  p_pipeline = sig(s_pipe,    bias=0.60)   — graph-level attack chains
+  p_plugin   = sig(s_plugin,  bias=0.60)   — plugin findings
+  p_nl       = sig(avg(s1, norm(s4)), bias=0.55)  — NL+judge (Phase 2 only)
+
+Combined (multi-signal synergy):
+  raw = 0.35·s3 + 0.30·s2 + 0.15·s_pipe + 0.10·(s2·s3)
+      + 0.08·s1  (bonus)  + 0.10·norm(s4)  (bonus)
+  p_combined = sig(raw, bias=0.35)
 
 Design properties:
-  • CMIA (s3) is the highest-weight primary signal — theoretically grounded,
-    obfuscation-invariant, lowest FP rate.
-  • NL score (s1) and judge score (s4) are ADDITIVE BONUSES only.
-    They cannot pull p downward — AV3 attacks with clean NL (s1≈0)
-    are handled naturally without any override.
-  • Interaction term s2·s3 captures "code is suspicious AND it diverges from
-    the NL description" as a jointly stronger signal.
-  • Weights and bias are transparent constants, clearly labelled as
-    PENDING CALIBRATION on SkillScan-1K. Once the dataset exists, replace
-    with logistic regression coefficients fitted on the validation split.
+  • ANY single strong signal is independently sufficient for WARN/REVIEW.
+    code-only attacks (s2 high, s3 low) → p_code pathway triggers.
+    NL-only attacks (s1+s4 high, code clean) → p_nl pathway triggers.
+    Misalignment attacks (AV3, AV4) → p_align pathway triggers.
+  • AV3 (clean NL, s1≈0): p_nl pathway is inactive, but p_align and
+    p_combined still catch the misalignment signal — no override needed.
+  • NL signals (s1, s4) remain additive bonuses in p_combined,
+    and form their own pathway in p_nl — they NEVER suppress other signals.
+  • All parameters are PENDING calibration on SkillScan-1K.
+    Replace pathway biases + combined weights with logistic-regression
+    coefficients fitted on the validation split once data is available.
 
-Calibration targets (verify once SkillScan-1K is available):
-  All signals zero (clean benign)  → p ≈ 0.05
-  s3=0.5, s2=0.5 (moderate)       → p ≈ 0.40 (WARN boundary)
-  s3=0.7, s2=0.6, pl=0.5          → p ≈ 0.72 (REVIEW)
-  s3=0.8, s2=0.7, pl=0.8, s4=0.8  → p ≈ 0.93 (BLOCK)
-  AV3: s1=0, s3=0.7, s2=0.5, s4=0.75 → p ≈ 0.67 (REVIEW, no override needed)
+Calibration targets:
+  All signals zero (clean benign)      → p ≈ 0.08
+  s2=0.5, s3=0.5 (moderate)           → p ≈ 0.50  WARN
+  s2=0.7, s3=0.1 (code only)          → p ≈ 0.74  REVIEW  ← was PASS
+  s1=0.8, s4=0.7 (NL only)            → p ≈ 0.59  WARN    ← was PASS
+  s2=0.6, s3=0.7, pl=0.5 (strong)     → p ≈ 0.79  REVIEW
+  s2=0.7, s3=0.8, pl=0.8, s4=0.8      → p ≈ 0.92  BLOCK
+  AV3: s1=0, s3=0.7, s2=0.5, s4=0.75  → p ≈ 0.74  REVIEW (no override)
 """
 from __future__ import annotations
 
@@ -54,24 +68,33 @@ from .models import (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fusion weights — PENDING calibration on SkillScan-1K validation split.
-# Replace with logistic-regression coefficients once labelled data is available.
+# Sigmoid parameters — PENDING calibration on SkillScan-1K validation split.
+# Replace pathway biases + combined weights with logistic-regression
+# coefficients fitted on the validation split once data is available.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Phase 1 signals (deterministic, always present)
-_W_CMIA      = 0.40   # s3: primary signal, obfusc-invariant
-_W_CODE      = 0.25   # s2: code threat (pattern + behavioral)
-_W_PIPELINE  = 0.15   # s_pipeline: multi-step graph chains
-_W_PLUGIN    = 0.05   # s_plugin: supporting evidence
-_W_INTERACT  = 0.10   # s2 × s3: joint code+misalign signal
+_K = 7.0   # steepness (shared across all pathways)
 
-# Phase 2 signals (additive bonuses — only contribute when positive)
-_W_NL        = 0.10   # s1: NL consistency (Phase 2b), bonus only
-_W_JUDGES    = 0.15   # s4: judge consensus above neutral (Phase 2c)
+# Per-pathway bias: raw score at which that pathway reaches p = 0.50
+_BIAS_CODE     = 0.55   # p_code     — pure code threat (T1–T9)
+_BIAS_ALIGN    = 0.55   # p_align    — NL–code misalignment (CMIA)
+_BIAS_PIPELINE = 0.60   # p_pipeline — graph-level attack chains
+_BIAS_PLUGIN   = 0.60   # p_plugin   — plugin findings
+_BIAS_NL       = 0.55   # p_nl       — NL + judge consensus
 
-# Sigmoid parameters
-_K    = 7.0    # steepness
-_BIAS = 0.40   # decision-boundary raw score → p = 0.50 at raw = BIAS
+# Combined-pathway weights (multi-signal synergy)
+_WC_ALIGN    = 0.35   # s3 — primary signal in combined
+_WC_CODE     = 0.30   # s2
+_WC_PIPELINE = 0.15   # s_pipeline
+_WC_INTERACT = 0.10   # s2 × s3
+_WC_NL       = 0.08   # s1 — additive bonus
+_WC_JUDGES   = 0.10   # norm(s4) — additive bonus
+_BIAS_COMBINED = 0.35  # combined pathway fires earlier (multi-signal synergy)
+
+
+def _sig(raw: float, bias: float) -> float:
+    """Sigmoid centred at `bias`."""
+    return 1.0 / (1.0 + math.exp(-_K * (raw - bias)))
 
 
 def fuse_scores(
@@ -83,29 +106,47 @@ def fuse_scores(
     s4:         float | None = None,  # judge consensus; None if Phase 2 skipped
 ) -> float:
     """
-    Compute P(malicious) via calibrated weighted sigmoid fusion.
+    Compute P(malicious) via multi-pathway max + combined sigmoid fusion.
 
-    s1 is treated as an additive bonus (never penalises).
-    s4 only contributes when judges ran (s4 is not None) and agree malicious.
+    Each attack vector has its OWN sigmoid pathway that can independently
+    trigger a WARN/REVIEW/BLOCK verdict.  The final score is:
+
+        p = max(p_code, p_align, p_pipeline, p_plugin, p_nl, p_combined)
+
+    Design properties:
+    • ANY single strong signal is sufficient — code-only attacks trigger
+      p_code; NL-only attacks trigger p_nl; misalignment triggers p_align.
+    • NL signals (s1, s4) NEVER suppress Phase 1 signals.
+    • s4 normalised to [0,1] above neutral: norm_s4 = (s4 − 0.5) × 2.
     """
-    # Phase 1 core
-    raw = (
-        _W_CMIA     * s3
-      + _W_CODE     * s2
-      + _W_PIPELINE * s_pipeline
-      + _W_PLUGIN   * s_plugin
-      + _W_INTERACT * s2 * s3
+    # Normalised judge score (0 when Phase 2 skipped or judges disagree)
+    norm_s4 = max((s4 - 0.5) * 2.0, 0.0) if s4 is not None else 0.0
+
+    # ── Independent pathways ─────────────────────────────────────────────────
+    p_code     = _sig(s2,                              _BIAS_CODE)
+    p_align    = _sig(s3,                              _BIAS_ALIGN)
+    p_pipeline = _sig(s_pipeline,                      _BIAS_PIPELINE)
+    p_plugin   = _sig(s_plugin,                        _BIAS_PLUGIN)
+
+    # NL pathway: average of NL threat and normalised judge score
+    nl_inputs = [x for x in (s1, norm_s4) if x > 0.0]
+    nl_raw    = sum(nl_inputs) / len(nl_inputs) if nl_inputs else 0.0
+    p_nl      = _sig(nl_raw, _BIAS_NL)
+
+    # ── Combined pathway (multi-signal synergy) ──────────────────────────────
+    raw_combined = (
+        _WC_ALIGN    * s3
+      + _WC_CODE     * s2
+      + _WC_PIPELINE * s_pipeline
+      + _WC_INTERACT * s2 * s3
+      + _WC_NL       * s1          # bonus — never penalises
+      + _WC_JUDGES   * norm_s4     # bonus — never penalises
     )
+    p_combined = _sig(raw_combined, _BIAS_COMBINED)
 
-    # Phase 2 additive bonuses
-    if s1 > 0.0:
-        raw += _W_NL * s1
-
-    if s4 is not None and s4 > 0.5:
-        # Normalise to [0, 1] range above neutral: (s4 - 0.5) * 2
-        raw += _W_JUDGES * (s4 - 0.5) * 2.0
-
-    return round(1.0 / (1.0 + math.exp(-_K * (raw - _BIAS))), 4)
+    # ── Final score: most alarming pathway wins ──────────────────────────────
+    p = max(p_code, p_align, p_pipeline, p_plugin, p_nl, p_combined)
+    return round(p, 4)
 
 
 def score_to_verdict(p_malicious: float) -> Verdict:
@@ -262,6 +303,8 @@ def assemble_report(
     s3 = cmia_score.overall
     # s4: None when Phase 2 was skipped (verdicts=[]) so fusion treats it as absent
     s4 = _judge_consensus_score(verdicts) if verdicts else None
+    # Report field requires a float; use neutral 0.5 when Phase 2 is skipped.
+    s4_for_report = s4 if s4 is not None else 0.5
 
     p_malicious = fuse_scores(
         s2=s2, s3=s3,
@@ -292,7 +335,7 @@ def assemble_report(
         s1_nl_threat=round(s1, 3),
         s2_code_threat=round(s2, 3),
         s3_cmia=round(s3, 3),
-        s4_llm_panel=round(s4, 3),
+        s4_llm_panel=round(s4_for_report, 3),
         s_pipeline=round(pipeline_score, 3),
         s_plugins=round(plugin_score, 3),
         p_malicious=p_malicious,

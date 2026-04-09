@@ -8,5 +8,8 @@ PAPER_DESIGN_v4.md
 *.md
 .DS_Store
 figures/
-.claude/
 __pycache__/
+.*/
+papers
+.claude/
+.qoder/
