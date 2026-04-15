@@ -52,6 +52,7 @@ _NEVER_LEGITIMISE = {
     ThreatCategory.SUPPLY_CHAIN,
     ThreatCategory.PERSISTENCE,
     ThreatCategory.TIME_BOMB,
+    ThreatCategory.MALICIOUS_URL,
 }
 
 # Categories whose NL coverage should be checked via contract
@@ -81,6 +82,13 @@ def enrich_signals(
     actions: list[EnrichmentAction] = []
     nl_scripts = nl_program.scripts_referenced()
 
+    # If NL extraction produced no script links at all (heuristic mode without
+    # LLM), phantom upgrades are unreliable — every script would be "phantom".
+    # Disable phantom upgrades in this case.
+    _has_any_script_link = bool(nl_scripts) or any(
+        step.target_script for step in nl_program.steps
+    )
+
     for i, finding in enumerate(code_signals.findings):
         if not finding.file:
             continue
@@ -93,8 +101,14 @@ def enrich_signals(
         nl_step = nl_program.find_step_for_script(script_path)
 
         # ── Case 1: Phantom Script ──
-        # Script exists in skill dir but is NOT referenced by any NL step
-        if nl_step is None and script_basename not in ("__init__.py", "setup.py", "conftest.py"):
+        # Script exists in skill dir but is NOT referenced by any NL step.
+        # Only apply when the NL extractor actually linked at least one script —
+        # otherwise all scripts look like phantoms (extraction failure FP).
+        if (
+            _has_any_script_link
+            and nl_step is None
+            and script_basename not in ("__init__.py", "setup.py", "conftest.py")
+        ):
             # Check if ANY NL step references this script
             is_phantom = script_basename not in nl_scripts and script_path not in nl_scripts
             if is_phantom and finding.severity.value in ("MEDIUM", "HIGH", "CRITICAL"):

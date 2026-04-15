@@ -10,6 +10,7 @@ Performs per-file static analysis:
 from __future__ import annotations
 
 import ast
+import ipaddress
 import math
 import os
 import re
@@ -168,7 +169,12 @@ class _ASTVisitor(ast.NodeVisitor):
         "http.client.HTTPConnection", "http.client.HTTPSConnection",
         "httpx.get", "httpx.post", "httpx.Client",
         "socket.socket", "socket.create_connection",
+        # DNS resolution (used for DNS-based exfiltration)
+        "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyname_ex",
     }
+    # Reverse-shell indicators
+    FD_REDIRECT_FUNCS = {"os.dup2", "os.dup"}
+    SHELL_BINARIES = {"/bin/sh", "/bin/bash", "/bin/zsh", "/bin/dash", "sh", "bash", "cmd.exe"}
     FILE_READ_FUNCS = {"open", "read", "readlines", "read_text", "read_bytes"}
     FILE_WRITE_FUNCS = {"write", "writelines", "write_text", "write_bytes"}
 
@@ -181,6 +187,13 @@ class _ASTVisitor(ast.NodeVisitor):
         self._all_strings: list[tuple[str, int]] = []  # (value, line)
         self._has_main_guard = False
         self._function_defs: list[str] = []
+        # Reverse-shell correlation signals
+        self._has_socket_connect = False
+        self._has_external_connect = False
+        self._has_fd_stdio_redirect = False
+        self._has_shell_spawn = False
+        self._has_interactive_shell = False
+        self._reverse_shell_line = 0
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -208,6 +221,15 @@ class _ASTVisitor(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         func_name = self._resolve_call_name(node)
         line = getattr(node, "lineno", 0)
+
+        # socket.connect(host, port) is stronger than socket.socket() for real outbound links
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "connect":
+            self._has_socket_connect = True
+            if not self._reverse_shell_line:
+                self._reverse_shell_line = line
+            host_hint = self._extract_connect_host(node)
+            if self._looks_external_host(host_hint):
+                self._has_external_connect = True
 
         # exec / eval / compile
         if func_name in self.EXEC_FUNCS:
@@ -238,6 +260,12 @@ class _ASTVisitor(ast.NodeVisitor):
                     detail=" ".join(cmd_list),
                     line=line,
                 ))
+                if self._looks_like_shell_spawn(cmd_list[0]):
+                    self._has_shell_spawn = True
+                    if any(str(a).strip().lower() in {"-i", "/i"} for a in cmd_list[1:]):
+                        self._has_interactive_shell = True
+                    if not self._reverse_shell_line:
+                        self._reverse_shell_line = line
                 if has_dynamic_elements:
                     self.findings.append(CodeFinding(
                         severity=Severity.MEDIUM,
@@ -254,20 +282,39 @@ class _ASTVisitor(ast.NodeVisitor):
                     detail=cmd_str,
                     line=line,
                 ))
+                first_token = cmd_str.split()[0] if cmd_str.split() else ""
+                if self._looks_like_shell_spawn(first_token):
+                    self._has_shell_spawn = True
+                    if any(tok in {"-i", "/i"} for tok in cmd_str.lower().split()):
+                        self._has_interactive_shell = True
+                    if not self._reverse_shell_line:
+                        self._reverse_shell_line = line
             else:
-                # Fully dynamic command
+                # Fully dynamic command — MEDIUM because we don't know what's in the variable
                 self.interface.side_effects.append(SideEffect(
                     effect_type="subprocess",
                     detail="<dynamic>",
                     line=line,
                 ))
                 self.findings.append(CodeFinding(
-                    severity=Severity.HIGH,
+                    severity=Severity.MEDIUM,
                     category=ThreatCategory.COMMAND_INJECTION,
                     description=f"Subprocess with fully dynamic command: {func_name}()",
                     file=self.filepath, line=line,
                     evidence=func_name,
                 ))
+
+        # Reverse-shell indicator: redirect stdio to socket/file descriptor
+        if func_name in self.FD_REDIRECT_FUNCS:
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                try:
+                    target_fd = int(node.args[1].value)
+                except (TypeError, ValueError):
+                    target_fd = None
+                if target_fd in (0, 1, 2):
+                    self._has_fd_stdio_redirect = True
+                    if not self._reverse_shell_line:
+                        self._reverse_shell_line = line
 
         # Network calls
         if func_name in self.NETWORK_FUNCS:
@@ -366,6 +413,25 @@ class _ASTVisitor(ast.NodeVisitor):
                     self.interface.sensitive_reads.append(f"env:{var}")
         self.generic_visit(node)
 
+    def visit_BinOp(self, node: ast.BinOp) -> None:
+        """Detect sensitive path construction via Path division: Path.home() / '.ssh' / 'id_rsa'"""
+        if isinstance(node.op, ast.Div):
+            parts = self._extract_path_div_parts(node)
+            if len(parts) >= 2:
+                joined = "/".join(parts)
+                if SENSITIVE_PATHS_RE.search(joined):
+                    if joined not in self.interface.sensitive_reads:
+                        self.interface.sensitive_reads.append(joined)
+                        line = getattr(node, "lineno", 0)
+                        self.findings.append(CodeFinding(
+                            severity=Severity.CRITICAL,
+                            category=ThreatCategory.CREDENTIAL_THEFT,
+                            description=f"Sensitive path via Path division: {joined}",
+                            file=self.filepath, line=line,
+                            evidence=joined,
+                        ))
+        self.generic_visit(node)
+
     def visit_If(self, node: ast.If) -> None:
         # Detect if __name__ == "__main__"
         if (isinstance(node.test, ast.Compare)
@@ -391,7 +457,17 @@ class _ASTVisitor(ast.NodeVisitor):
         # String analysis: high entropy, sensitive paths, URLs
         for s, line in self._all_strings:
             if SENSITIVE_PATHS_RE.search(s):
-                if s not in self.interface.sensitive_reads:
+                # Skip short bare filenames like ".env", "env", ".venv" that
+                # appear in exclusion lists or documentation — they're not real
+                # path accesses.  Require a path separator or home-dir prefix.
+                is_bare_filename = (
+                    len(s) <= 10
+                    and "/" not in s
+                    and "\\" not in s
+                    and not s.startswith("~")
+                    and not s.startswith("$")
+                )
+                if not is_bare_filename and s not in self.interface.sensitive_reads:
                     self.interface.sensitive_reads.append(s)
             if EXTERNAL_URL_RE.search(s):
                 if EXFIL_PATTERN_RE.search(s):
@@ -402,8 +478,9 @@ class _ASTVisitor(ast.NodeVisitor):
                         file=self.filepath, line=line,
                         evidence=s[:120],
                     ))
+            # Raise thresholds to reduce docstring/UUID false positives
             ent = _shannon_entropy(s)
-            if ent > 4.5 and len(s) > 40:
+            if ent > 5.0 and len(s) > 64:
                 self.interface.has_encoded_payloads = True
                 self.findings.append(CodeFinding(
                     severity=Severity.MEDIUM,
@@ -423,6 +500,20 @@ class _ASTVisitor(ast.NodeVisitor):
         for s, line in self._all_strings:
             if "sys.meta_path" in s or "__import__" in s:
                 self.interface.analyzability = min(self.interface.analyzability, 0.3)
+
+        # Correlate reverse-shell behavior from multiple weak signals.
+        if self._has_socket_connect and self._has_fd_stdio_redirect and self._has_shell_spawn:
+            severity = Severity.CRITICAL if (self._has_external_connect or self._has_interactive_shell) else Severity.HIGH
+            confidence = 0.95 if severity == Severity.CRITICAL else 0.85
+            self.findings.append(CodeFinding(
+                severity=severity,
+                category=ThreatCategory.REMOTE_CODE_EXEC,
+                description="Reverse shell behavior: socket.connect + stdio redirection + shell spawn",
+                file=self.filepath,
+                line=self._reverse_shell_line,
+                evidence="socket.connect + os.dup2 + shell",
+                confidence=confidence,
+            ))
 
     # ── Helpers ──
 
@@ -481,6 +572,64 @@ class _ASTVisitor(ast.NodeVisitor):
                 result.append(a.value)
         return result
 
+    def _extract_connect_host(self, node: ast.Call) -> str:
+        """Extract host hint from socket.connect((host, port))."""
+        if not node.args:
+            return ""
+        first = node.args[0]
+        if isinstance(first, ast.Tuple) and first.elts:
+            host = first.elts[0]
+            if isinstance(host, ast.Constant) and isinstance(host.value, str):
+                return host.value
+            if isinstance(host, ast.Name):
+                return f"<{host.id.lower()}>"
+            return "<dynamic>"
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return first.value
+        return "<dynamic>"
+
+    def _looks_external_host(self, host: str) -> bool:
+        if not host:
+            return False
+        host_lower = host.lower().strip()
+        if host_lower in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+            return False
+        if host_lower.startswith("<") and host_lower.endswith(">"):
+            return any(tag in host_lower for tag in ("c2", "attacker", "remote", "beacon"))
+        try:
+            ip = ipaddress.ip_address(host_lower)
+            return not (ip.is_private or ip.is_loopback or ip.is_link_local)
+        except ValueError:
+            # Hostname/domain: treat as external unless clearly local.
+            if host_lower.endswith(".local"):
+                return False
+        return True
+
+    def _looks_like_shell_spawn(self, cmd: str) -> bool:
+        if not cmd:
+            return False
+        cmd_lower = cmd.lower().strip().strip("'\"")
+        cmd_base = os.path.basename(cmd_lower)
+        return cmd_lower in self.SHELL_BINARIES or cmd_base in {"sh", "bash", "zsh", "dash", "cmd", "cmd.exe"}
+
+    def _extract_path_div_parts(self, node: ast.AST) -> list[str]:
+        """Recursively extract string segments from chained Path division.
+
+        e.g. Path.home() / ".ssh" / "id_rsa"  →  ["~", ".ssh", "id_rsa"]
+        """
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left_parts = self._extract_path_div_parts(node.left)
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, str):
+                return left_parts + [node.right.value]
+            return left_parts
+        elif isinstance(node, ast.Call):
+            func = self._resolve_call_name(node)
+            func_lower = func.lower()
+            # Only treat home-dir roots as sensitive anchors; cwd() is project scope
+            if "home" in func_lower or "expanduser" in func_lower:
+                return ["~"]
+        return []
+
 
 def _analyze_python_file(filepath: str) -> tuple[list[CodeFinding], ScriptInterface]:
     """Parse a Python file via AST and extract findings + interface."""
@@ -523,20 +672,44 @@ _PATTERN_RULES: list[tuple[str, re.Pattern, Severity, ThreatCategory]] = [
 ]
 
 
-def _scan_text_file(filepath: str) -> list[CodeFinding]:
-    """Regex-based pattern scan for any text file."""
+def _scan_text_file(filepath: str, ext: str = "") -> list[CodeFinding]:
+    """Regex-based pattern scan for any text file.
+
+    For documentation (.md) and config (.yaml/.yml) files we skip
+    PROMPT_INJECTION_RE and SENSITIVE_PATHS_RE because those files legitimately
+    describe capabilities/paths without actually executing them.  Only hard
+    exfil-endpoint patterns and supply-chain patterns are applied.
+    """
     try:
         content = Path(filepath).read_text(encoding="utf-8", errors="replace")
     except (OSError, UnicodeDecodeError):
         return []
+
+    _doc_ext = {".md", ".yaml", ".yml", ".txt", ".rst"}
+    actual_ext = ext or Path(filepath).suffix.lower()
+    is_doc = actual_ext in _doc_ext
+    is_py  = actual_ext == ".py"
+
+    # Patterns skipped for documentation/config files (too noisy, too many FPs)
+    _doc_skip_categories = {ThreatCategory.PROMPT_INJECTION, ThreatCategory.CREDENTIAL_THEFT}
+
+    # For Python files the AST already handles sensitive-path detection precisely
+    # (via open() / os.path.join analysis). Running SENSITIVE_PATHS_RE on raw
+    # Python text matches docstrings, comments, and exclusion-list strings —
+    # causing a large number of false positives.
+    _py_skip_categories = {ThreatCategory.CREDENTIAL_THEFT}
 
     findings: list[CodeFinding] = []
     lines = content.split("\n")
 
     for line_no, line_text in enumerate(lines, 1):
         for desc, pattern, severity, category in _PATTERN_RULES:
+            if is_doc and category in _doc_skip_categories:
+                continue
+            if is_py and category in _py_skip_categories:
+                continue
             if pattern.search(line_text):
-                # Skip if it's a comment explaining patterns (in test/doc files)
+                # Skip comment lines (except actual injection in .py files)
                 stripped = line_text.strip()
                 if stripped.startswith("#") and category != ThreatCategory.PROMPT_INJECTION:
                     continue
@@ -557,36 +730,158 @@ def _scan_text_file(filepath: str) -> list[CodeFinding]:
 # =============================================================================
 
 def _analyze_non_python(filepath: str) -> tuple[list[CodeFinding], ScriptInterface | None]:
-    """Analyze non-Python text files (shell scripts, markdown, yaml, etc.)."""
-    findings = _scan_text_file(filepath)
+    """Analyze non-Python text files (shell scripts, JS/TS, yaml, markdown, etc.)."""
+    ext = Path(filepath).suffix.lower()
+    findings = _scan_text_file(filepath, ext=ext)
 
     ext = Path(filepath).suffix.lower()
+
     if ext in (".sh", ".bash", ".zsh"):
-        # Basic shell script interface extraction
         iface = ScriptInterface(script_path=filepath)
         try:
             content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return findings, iface
 
-        # Check for stdin/args
         if "$1" in content or "$@" in content or "$*" in content:
             iface.inputs.append(InputSource(source_type="argv", detail="shell args"))
         if "read " in content or "/dev/stdin" in content:
             iface.inputs.append(InputSource(source_type="stdin"))
 
-        # Check for curl/wget (network)
         for match in re.finditer(r"(curl|wget)\s+.*?(https?://\S+)", content):
             url = match.group(2)
-            iface.side_effects.append(SideEffect(
-                effect_type="network_request", detail=url,
-            ))
+            iface.side_effects.append(SideEffect(effect_type="network_request", detail=url))
             if "-d" in match.group(0) or "--data" in match.group(0) or "-X POST" in match.group(0):
                 iface.outputs.append(OutputSink(sink_type=SinkType.NETWORK_POST, detail=url))
 
-        # Check for sensitive paths
         for match in SENSITIVE_PATHS_RE.finditer(content):
             iface.sensitive_reads.append(match.group(0))
+
+        # Detect supply chain in shell: curl | bash, wget | sh
+        if re.search(r"(curl|wget)\s+.+\|\s*(bash|sh|python|node)", content):
+            iface.has_dynamic_execution = True
+            iface.analyzability = min(iface.analyzability, 0.3)
+            findings.append(CodeFinding(
+                severity=Severity.CRITICAL,
+                category=ThreatCategory.SUPPLY_CHAIN,
+                description="Shell script pipes remote content to interpreter (curl|bash)",
+                file=filepath,
+                confidence=0.95,
+            ))
+
+        return findings, iface
+
+    elif ext in (".js", ".ts", ".mjs", ".cjs"):
+        iface = ScriptInterface(script_path=filepath)
+        try:
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return findings, iface
+
+        # Network calls
+        for match in re.finditer(
+            r"(?:fetch|axios|http(?:s)?\.request|got|superagent)\s*\(\s*['\"]?(https?://[^'\")\s]+)",
+            content, re.IGNORECASE,
+        ):
+            url = match.group(1)
+            iface.side_effects.append(SideEffect(effect_type="network_request", detail=url))
+            if EXTERNAL_URL_RE.search(url) and not EXFIL_PATTERN_RE.search(url):
+                findings.append(CodeFinding(
+                    severity=Severity.MEDIUM,
+                    category=ThreatCategory.DATA_EXFILTRATION,
+                    description=f"External network call in JS/TS: {url[:80]}",
+                    file=filepath,
+                    evidence=url[:100],
+                ))
+            if EXFIL_PATTERN_RE.search(url):
+                findings.append(CodeFinding(
+                    severity=Severity.CRITICAL,
+                    category=ThreatCategory.DATA_EXFILTRATION,
+                    description=f"Known exfiltration endpoint in JS/TS: {url[:80]}",
+                    file=filepath,
+                    evidence=url[:100],
+                ))
+
+        # Process spawn / exec
+        for match in re.finditer(
+            r"(?:child_process|exec|spawn|execSync|spawnSync)\s*[\.(]",
+            content, re.IGNORECASE,
+        ):
+            iface.side_effects.append(SideEffect(
+                effect_type="subprocess", detail="child_process",
+                line=content[:match.start()].count("\n") + 1,
+            ))
+
+        # eval / Function() dynamic execution
+        if re.search(r"\beval\s*\(|\bnew\s+Function\s*\(", content):
+            iface.has_dynamic_execution = True
+            iface.analyzability = min(iface.analyzability, 0.3)
+            findings.append(CodeFinding(
+                severity=Severity.HIGH,
+                category=ThreatCategory.REMOTE_CODE_EXEC,
+                description="Dynamic code execution in JS/TS: eval() or new Function()",
+                file=filepath,
+            ))
+
+        # Sensitive env var access
+        for match in re.finditer(
+            r"process\.env\[?['\"]?(\w+)['\"]?\]?",
+            content,
+        ):
+            var = match.group(1)
+            iface.inputs.append(InputSource(source_type="env_var", detail=var))
+            if ENV_KEYWORDS_RE.search(var):
+                iface.sensitive_reads.append(f"env:{var}")
+
+        # Sensitive file access (fs.readFile, fs.readFileSync)
+        for match in re.finditer(
+            r"(?:readFile(?:Sync)?|createReadStream)\s*\(\s*['\"]([^'\"]+)['\"]",
+            content,
+        ):
+            path = match.group(1)
+            if SENSITIVE_PATHS_RE.search(path):
+                iface.sensitive_reads.append(path)
+                findings.append(CodeFinding(
+                    severity=Severity.CRITICAL,
+                    category=ThreatCategory.CREDENTIAL_THEFT,
+                    description=f"Sensitive file access in JS/TS: {path}",
+                    file=filepath,
+                    evidence=path,
+                ))
+
+        return findings, iface
+
+    elif ext in (".yaml", ".yml"):
+        # Enhanced YAML analysis for supply chain and permission anomalies
+        try:
+            content = Path(filepath).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return findings, None
+
+        iface = ScriptInterface(script_path=filepath)
+
+        # Check for overly broad permissions in YAML manifests
+        if re.search(r"permissions?\s*:", content, re.IGNORECASE):
+            if re.search(r"(all|any|\*)", content):
+                findings.append(CodeFinding(
+                    severity=Severity.HIGH,
+                    category=ThreatCategory.CAPABILITY_INFLATION,
+                    description="YAML manifest declares wildcard/all permissions",
+                    file=filepath,
+                    confidence=0.8,
+                ))
+
+        # Check for external URLs in YAML configs
+        for match in EXTERNAL_URL_RE.finditer(content):
+            url = match.group(0)
+            if EXFIL_PATTERN_RE.search(url):
+                findings.append(CodeFinding(
+                    severity=Severity.CRITICAL,
+                    category=ThreatCategory.DATA_EXFILTRATION,
+                    description=f"Known exfiltration endpoint in YAML: {url[:80]}",
+                    file=filepath,
+                    evidence=url[:100],
+                ))
 
         return findings, iface
 
@@ -692,7 +987,7 @@ def scan_code(skill_dir: str) -> CodeSignals:
         if ext == ".py":
             # Full AST + pattern analysis for Python
             findings, iface = _analyze_python_file(str(fpath))
-            pattern_findings = _scan_text_file(str(fpath))
+            pattern_findings = _scan_text_file(str(fpath), ext=".py")
 
             # Deduplicate: don't report pattern findings already caught by AST
             ast_evidence = {f.evidence for f in findings if f.evidence}
@@ -719,7 +1014,7 @@ def scan_code(skill_dir: str) -> CodeSignals:
                 signals.has_dynamic_execution = True
 
         else:
-            # Pattern scan + basic interface for shell scripts
+            # Pattern scan + basic interface for shell scripts, JS/TS, YAML, etc.
             findings, iface = _analyze_non_python(str(fpath))
             for f in findings:
                 if f.file and os.path.isabs(f.file):
@@ -729,7 +1024,15 @@ def scan_code(skill_dir: str) -> CodeSignals:
             if iface is not None:
                 iface.script_path = rel
                 signals.script_interfaces[rel] = iface
-                signals.all_scripts.append(rel)
+                # Track JS/TS as proper scripts
+                if ext in (".js", ".ts", ".mjs", ".cjs"):
+                    signals.all_scripts.append(rel)
+                    if iface.has_dynamic_execution:
+                        signals.has_dynamic_execution = True
+                    if iface.has_obfuscation:
+                        signals.has_obfuscation = True
+                elif ext in (".sh", ".bash", ".zsh"):
+                    signals.all_scripts.append(rel)
 
     # Compute overall analyzability
     if signals.script_interfaces:
@@ -748,5 +1051,19 @@ def scan_code(skill_dir: str) -> CodeSignals:
             seen.add(key)
             unique.append(f)
     signals.findings = unique
+
+    # Collect all external URLs from script side-effects (for Layer 1E VT check)
+    url_seen: set[str] = set()
+    for iface in signals.script_interfaces.values():
+        for se in iface.side_effects:
+            if (
+                se.effect_type == "network_request"
+                and se.detail
+                and se.detail != "<dynamic>"
+                and se.detail not in url_seen
+                and EXTERNAL_URL_RE.search(se.detail)
+            ):
+                url_seen.add(se.detail)
+                signals.external_urls.append(se.detail)
 
     return signals

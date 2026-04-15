@@ -47,6 +47,7 @@ class ThreatCategory(str, Enum):
     CAPABILITY_INFLATION = "CapabilityInflation"
     CROSS_SCRIPT_EXFIL = "CrossScriptExfiltration"
     PHANTOM_SCRIPT = "PhantomScript"
+    MALICIOUS_URL = "MaliciousURL"
     UNKNOWN = "Unknown"
 
 
@@ -153,6 +154,8 @@ class CodeSignals:
     has_encoded_payloads: bool = False
     has_dynamic_execution: bool = False
     all_scripts: list[str] = field(default_factory=list)
+    # External URLs extracted from code (populated by Layer 0A, consumed by Layer 1E)
+    external_urls: list[str] = field(default_factory=list)
 
 
 # =============================================================================

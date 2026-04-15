@@ -5,11 +5,13 @@ Runs the three-layer pipeline:
   Layer 0: Foundation (parallel extraction)
     0A: Code Threat Scanner + Script Interface Extractor
     0B: NL Program Extractor
+    0B2: Static Prompt Injection Pre-filter (AV5)
     0C: Manifest Validator
   Layer 1: Cross-Modal Joint Analysis
     1A: Contract Verification
     1B: Cross-Modal Taint Analysis
     1C: Signal Enrichment
+    1D: Pipeline Kill-Chain Analysis (AV6)
   Layer 2: Verdict Fusion
 """
 from __future__ import annotations
@@ -38,6 +40,9 @@ def scan_skill(
     use_llm: bool = True,
     model: str | None = None,
     quiet: bool = False,
+    vt_api_key: str | None = None,
+    vt_api_keys: list[str] | None = None,
+    vt_wait_seconds: int = 60,
 ) -> NEXUSReport:
     """
     Run the full NEXUS scan on a skill directory.
@@ -47,6 +52,11 @@ def scan_skill(
         use_llm: whether to use LLM for NL extraction and contract inference
         model: override LLM model name
         quiet: suppress progress output
+        vt_api_key: Single VirusTotal API key (backward-compatible).
+        vt_api_keys: List of VT API keys for multi-key rotation.
+                     Keys are merged with vt_api_key and VT_API_KEYS env var.
+                     If none are configured, the VT check is silently skipped.
+        vt_wait_seconds: max seconds to wait for each VT analysis to complete
     """
     start = time.time()
     llm_calls = 0
@@ -108,6 +118,31 @@ def scan_skill(
     _log(f"      Purpose: {nl_program.declared_purpose[:60]}...")
     _log(f"      {len(nl_program.steps)} steps, scripts referenced: {nl_program.scripts_referenced()}")
 
+    # 0B2: Static Prompt Injection Pre-filter (AV5)
+    _log("  0B2: Checking for prompt injection...")
+    from nexus.layer0.injection_detector import scan_skill_for_injection
+    from nexus.models import CodeFinding, Severity, ThreatCategory
+    injection_result = scan_skill_for_injection(str(skill_path))
+    if injection_result.is_injection:
+        _log(f"      ⚠ INJECTION DETECTED (confidence={injection_result.confidence:.2f})")
+        # Inject as a high-severity code finding
+        inj_finding = CodeFinding(
+            severity=Severity.CRITICAL if injection_result.confidence > 0.7 else Severity.HIGH,
+            category=ThreatCategory.PROMPT_INJECTION,
+            description=(
+                f"Prompt injection detected in SKILL.md "
+                f"(confidence={injection_result.confidence:.2f}): "
+                + "; ".join(f"{t}/{n}" for t, n in injection_result.detections[:3])
+            ),
+            file="SKILL.md",
+            line=0,
+            evidence="; ".join(injection_result.evidence[:3]),
+            confidence=injection_result.confidence,
+        )
+        code_signals.findings.insert(0, inj_finding)
+    else:
+        _log(f"      No injection detected")
+
     # 0C: Manifest Validator
     _log("  0C: Validating manifest...")
     from nexus.layer0.manifest_validator import validate_manifest
@@ -159,6 +194,47 @@ def scan_skill(
     downgrades = sum(1 for a in enrichment_actions if a.action == "downgrade")
     _log(f"      {upgrades} upgrades, {downgrades} downgrades")
 
+    # 1D: Pipeline Kill-Chain Analysis (AV6)
+    _log("  1D: Analyzing pipeline attack chains...")
+    from nexus.layer1.pipeline_analyzer import analyze_pipeline
+    pipeline_result = analyze_pipeline(nl_program, code_signals)
+    _log(f"      {len(pipeline_result.chains)} attack chains, pipeline_score={pipeline_result.pipeline_score:.3f}")
+    if pipeline_result.chains:
+        for chain in pipeline_result.chains[:2]:
+            _log(f"        [{chain.severity.value}] {chain.chain_type}: {chain.description[:80]}")
+
+    # 1E: URL Reputation Check (VirusTotal)
+    _log("  1E: Checking URL reputation via VirusTotal...")
+    from nexus.layer1.url_reputation import check_url_reputation
+    url_rep_result = check_url_reputation(
+        code_signals,
+        api_key=vt_api_key,
+        api_keys=vt_api_keys,
+        wait_seconds=vt_wait_seconds,
+    )
+    if url_rep_result.pool_status == [] and not url_rep_result.checked_urls and not url_rep_result.skipped_urls:
+        # Pool was empty (no keys configured) — silent skip
+        _log("      Skipped (no VT_API_KEY configured)")
+    else:
+        _log(
+            f"      Checked {len(url_rep_result.checked_urls)} URLs, "
+            f"skipped {len(url_rep_result.skipped_urls)} trusted, "
+            f"{len(url_rep_result.findings)} reputation findings"
+        )
+        if url_rep_result.findings:
+            for rf in url_rep_result.findings[:3]:
+                _log(f"        [{rf.severity.value}] {rf.description[:90]}")
+        if url_rep_result.errors:
+            for err in url_rep_result.errors[:2]:
+                _log(f"        [warn] {err}")
+                errors.append(f"VT URL check: {err}")
+        if url_rep_result.pool_status:
+            _log(f"      Key pool: " + ", ".join(
+                f"{s['key']} → {s['status']}" for s in url_rep_result.pool_status
+            ))
+        # Inject VT findings into code_signals for downstream scoring
+        code_signals.findings.extend(url_rep_result.findings)
+
     # =====================================================================
     # Layer 2: Verdict
     # =====================================================================
@@ -172,6 +248,8 @@ def scan_skill(
         contract_result=contract_result,
         taint_result=taint_result,
         enrichment_actions=enrichment_actions,
+        pipeline_result=pipeline_result,
+        injection_result=injection_result,
         scan_duration=time.time() - start,
         llm_calls=llm_calls,
         errors=errors,
